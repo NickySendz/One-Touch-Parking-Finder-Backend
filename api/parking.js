@@ -5,24 +5,22 @@ export default async function handler(req, res) {
   const { lat, lon, type } = req.query;
   if (!lat || !lon) return res.status(400).json({ error: 'Missing lat/lon' });
 
-  // ── STREET PARKING via Overpass API (OpenStreetMap) ──
+  // ── STREET PARKING via Overpass API ──
   if (type === 'street') {
     try {
-      const r = 600; // 600m radius
+      const r = 800;
+      // Much broader query — catches all OSM parking tagging styles used in Canada
       const query = `
-        [out:json][timeout:15];
+        [out:json][timeout:25];
         (
-          node["amenity"="parking"]["parking"="street_side"](around:${r},${lat},${lon});
-          node["amenity"="parking"]["parking"="lane"](around:${r},${lat},${lon});
-          node["amenity"="parking"]["parking"="layby"](around:${r},${lat},${lon});
-          way["amenity"="parking"]["parking"="street_side"](around:${r},${lat},${lon});
-          way["amenity"="parking"]["parking"="lane"](around:${r},${lat},${lon});
-          node["highway"="parking_entrance"](around:${r},${lat},${lon});
-          node["amenity"="parking_space"](around:${r},${lat},${lon});
-          way["parking:lane:both"](around:${r},${lat},${lon});
-          way["parking:lane:right"](around:${r},${lat},${lon});
-          way["parking:lane:left"](around:${r},${lat},${lon});
-          node["amenity"="parking"]["access"!="private"](around:${r},${lat},${lon});
+          way["highway"]["parking:lane:both"!~"no"](around:${r},${lat},${lon});
+          way["highway"]["parking:lane:right"!~"no"](around:${r},${lat},${lon});
+          way["highway"]["parking:lane:left"!~"no"](around:${r},${lat},${lon});
+          way["highway"]["parking:lane:both"="parallel"](around:${r},${lat},${lon});
+          way["highway"]["parking:lane:both"="diagonal"](around:${r},${lat},${lon});
+          way["highway"]["parking:lane:both"="perpendicular"](around:${r},${lat},${lon});
+          node["amenity"="parking"]["access"!="private"]["access"!="no"](around:${r},${lat},${lon});
+          way["amenity"="parking"]["access"!="private"]["access"!="no"](around:${r},${lat},${lon});
         );
         out center tags;
       `;
@@ -34,66 +32,70 @@ export default async function handler(req, res) {
       });
 
       if (!overpassRes.ok) {
-        return res.status(500).json({ error: 'Overpass API error', status: overpassRes.status });
+        const txt = await overpassRes.text();
+        return res.status(500).json({ error: 'Overpass error', status: overpassRes.status, detail: txt.slice(0, 300) });
       }
 
       const data = await overpassRes.json();
       const elements = data.elements || [];
 
-      // Deduplicate by proximity and normalize
       const seen = new Set();
-      const results = elements
-        .map(el => {
-          const elLat = el.lat || el.center?.lat;
-          const elLon = el.lon || el.center?.lon;
-          if (!elLat || !elLon) return null;
+      const results = elements.map(el => {
+        const elLat = el.lat || el.center?.lat;
+        const elLon = el.lon || el.center?.lon;
+        if (!elLat || !elLon) return null;
 
-          // Deduplicate nearby points
-          const key = `${Math.round(elLat * 1000)}_${Math.round(elLon * 1000)}`;
-          if (seen.has(key)) return null;
-          seen.add(key);
+        // Deduplicate
+        const key = `${(elLat).toFixed(3)}_${(elLon).toFixed(3)}`;
+        if (seen.has(key)) return null;
+        seen.add(key);
 
-          const tags = el.tags || {};
-          const parkingType = tags['parking'] || tags['parking:lane:both'] || tags['parking:lane:right'] || tags['parking:lane:left'] || 'street';
-          const fee = tags['fee'] || tags['parking:fee'] || null;
-          const maxStay = tags['maxstay'] || tags['parking:maxstay'] || null;
-          const access = tags['access'] || 'yes';
-          const isFree = fee === 'no' || fee === 'free';
-          const isMetered = fee === 'yes' || fee === 'meter' || tags['payment:coins'] === 'yes';
-          const name = tags['name'] || tags['addr:street']
-            ? (tags['name'] || tags['addr:street'] + (tags['addr:housenumber'] ? ' ' + tags['addr:housenumber'] : ''))
-            : 'Street Parking';
+        const tags = el.tags || {};
 
-          const address = [tags['addr:street'], tags['addr:city']]
-            .filter(Boolean).join(', ') || '';
+        // Figure out parking type and fee from all possible tag combos
+        const laneTag = tags['parking:lane:both'] || tags['parking:lane:right'] || tags['parking:lane:left'] || '';
+        const feeTag = tags['parking:lane:both:fee'] || tags['parking:fee'] || tags['fee'] || '';
+        const maxStay = tags['parking:lane:both:maxstay'] || tags['parking:lane:right:maxstay'] || tags['parking:lane:left:maxstay'] || tags['maxstay'] || null;
+        const streetName = tags['name'] || tags['addr:street'] || tags['ref'] || null;
+        const isMetered = feeTag === 'yes' || feeTag === 'meter' || tags['payment:coins'] === 'yes' || tags['payment:meter'] === 'yes';
+        const isFree = feeTag === 'no' || feeTag === 'free' || (!isMetered && feeTag === '');
+        const parkStyle = laneTag || tags['parking'] || 'street';
 
-          return {
-            place_id: 'street_' + el.id,
-            name,
-            vicinity: address,
-            geometry: { location: { lat: elLat, lng: elLon } },
-            rating: null,
-            opening_hours: { open_now: true },
-            is_street: true,
-            parking_type: parkingType,
-            fee: fee,
-            is_free: isFree,
-            is_metered: isMetered,
-            max_stay: maxStay,
-            access,
-          };
-        })
-        .filter(Boolean)
-        .slice(0, 30);
+        const name = streetName
+          ? `${streetName} — Street Parking`
+          : `Street Parking`;
 
-      return res.status(200).json({ results, source: 'overpass', raw_count: elements.length });
+        const address = [tags['addr:street'], tags['addr:city']].filter(Boolean).join(', ');
+
+        return {
+          place_id: 'street_' + el.id,
+          name,
+          vicinity: address,
+          geometry: { location: { lat: elLat, lng: elLon } },
+          rating: null,
+          opening_hours: { open_now: true },
+          is_street: true,
+          parking_type: parkStyle,
+          fee: feeTag,
+          is_free: isFree,
+          is_metered: isMetered,
+          max_stay: maxStay,
+        };
+      }).filter(Boolean).slice(0, 40);
+
+      return res.status(200).json({
+        results,
+        source: 'overpass',
+        raw_count: elements.length,
+        debug_sample: elements.slice(0, 2).map(e => ({ type: e.type, tags: e.tags }))
+      });
 
     } catch (err) {
       return res.status(500).json({ error: 'Failed to fetch street parking', detail: err.message });
     }
   }
 
-  // ── EV CHARGERS via Google Places ──
+  // ── EV CHARGERS + PARKING via Google Places ──
   const apiKey = process.env.GOOGLE_API_KEY;
   const url = `https://places.googleapis.com/v1/places:searchNearby`;
   const placeType = type === 'ev' ? 'electric_vehicle_charging_station' : 'parking';
